@@ -1,6 +1,6 @@
 ---
 name: youtube-transcript-ingestion
-description: Batch-grab transcripts from any YouTube channel and save them as readable markdown files with clean frontmatter. Guided 5-step flow -- channel, keyword + date filter, output folder, optional context-delta comparison, rate-limit strategy -- using yt-dlp for metadata and markitdown for transcripts. Optionally compares results against your existing notes to surface only what is genuinely new. Trigger phrases: grab YouTube transcripts, ingest YouTube channel, yt-dlp transcripts, markitdown YouTube, research a creator's videos, build a corpus from a channel, filter content overload from a channel.
+description: Batch-grab transcripts from any YouTube channel and save them as readable markdown files with clean frontmatter. Guided 5-step flow -- channel, keyword + date filter, output folder, optional context-delta comparison, rate-limit strategy -- using yt-dlp for metadata and markitdown for transcripts. Optionally compares results against your existing notes to surface only what is genuinely new. Trigger phrases -- grab YouTube transcripts, ingest YouTube channel, yt-dlp transcripts, markitdown YouTube, research a creator's videos, build a corpus from a channel, filter content overload from a channel.
 ---
 
 # YouTube Transcript Ingestion
