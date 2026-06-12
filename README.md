@@ -21,9 +21,11 @@ npx skills update youtube-transcript-ingestion
 Two command-line tools:
 
 ```bash
-brew install yt-dlp        # video metadata (no download)
-pip install markitdown     # transcript extraction
+brew install yt-dlp                              # video metadata (no download)
+pip install 'markitdown[youtube-transcription]'  # transcript extraction (keep the quotes)
 ```
+
+> Note: a bare `pip install markitdown` will *not* fetch YouTube transcripts -- the `[youtube-transcription]` extra is required.
 
 The skill runs a pre-flight check and tells you exactly what to install if anything is missing.
 

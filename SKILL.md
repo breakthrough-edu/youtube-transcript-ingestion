@@ -35,10 +35,13 @@ Trigger phrases: "grab YouTube transcripts", "ingest YouTube channel", "yt-dlp t
 Before starting, verify the two required tools. Run this:
 
 ```bash
-echo "yt-dlp: $(which yt-dlp 2>/dev/null || echo NOT FOUND)"
-echo "markitdown: $(which markitdown 2>/dev/null || \
-  find /Library/Frameworks/Python.framework -name 'markitdown' 2>/dev/null | head -1 || \
-  echo NOT FOUND)"
+echo "yt-dlp:     $(which yt-dlp 2>/dev/null || echo NOT FOUND)"
+echo "markitdown: $(which markitdown 2>/dev/null || echo NOT FOUND)"
+# markitdown ships YouTube support as an OPTIONAL extra -- a bare install
+# passes the check above but cannot fetch transcripts. Verify it for real:
+python3 -c "import youtube_transcript_api" 2>/dev/null \
+  && echo "youtube support: OK" \
+  || echo "youtube support: MISSING (install the extra below)"
 ```
 
 **If yt-dlp is missing:**
@@ -53,11 +56,11 @@ pip install yt-dlp
 npm install -g yt-dlp
 ```
 
-**If markitdown is missing:**
+**If markitdown is missing (or has no YouTube support):**
 ```bash
-pip install markitdown
-# or, for the MCP server version:
-pip install "markitdown-mcp==0.0.1a4" --no-deps && pip install "mcp>=1.0.0"
+# IMPORTANT: a bare "pip install markitdown" does NOT include YouTube support.
+# You must install the youtube-transcription extra -- keep the quotes:
+pip install 'markitdown[youtube-transcription]'
 ```
 
 After install, find the binary path if it's not in PATH:
