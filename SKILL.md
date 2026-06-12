@@ -24,7 +24,7 @@ Trigger phrases: "grab YouTube transcripts", "ingest YouTube channel", "yt-dlp t
 1. Extracts the full video list from any YouTube channel (no download, metadata only)
 2. Filters by date range + title keywords
 3. Validates actual upload dates (flat-playlist timestamps are unreliable -- always verify)
-4. Fetches full transcripts for each matched video via markitdown
+4. Fetches full transcripts for each matched video (markitdown by default; yt-dlp + browser cookies when rate-limited)
 5. Saves each as a `.md` file with clean YAML frontmatter into a folder of the user's choice
 6. Optionally compares transcripts against an existing notes/context folder to surface only what's genuinely new
 
@@ -185,23 +185,20 @@ If the user provides a path: note it. Run the delta comparison after Step 5 comp
 
 Explain, then ask:
 
-> "YouTube rate-limits transcript requests after roughly 20 in a row from the same IP. Two options:"
+> "YouTube throttles transcript requests after roughly 15-20 in a row from the same IP (you'll see `HTTP 429` / 'Sign in to confirm you're not a bot'). Two ways to handle it:"
 >
-> **Option A -- Safe mode** (recommended for first run)
-> 5-second pause between each request. Reliable up to ~50 videos. No setup needed.
-> Estimated time: approximately N × 7 seconds total.
+> **Option A -- Pacing** (recommended for a first, small run)
+> A 5-second pause between requests. Reliable up to ~50 videos, no setup. Uses markitdown.
+> Estimated time: roughly N × 7 seconds total.
 >
-> **Option B -- Cookie mode**
-> Uses your logged-in YouTube session cookies. Fast, no rate limit, works for any batch size.
-> Requires a one-time setup step. Type `setup cookies` for instructions.
+> **Option B -- Browser cookies** (for large batches, or if you're already blocked)
+> Reads your logged-in YouTube session straight from your browser via `yt-dlp --cookies-from-browser`. Bypasses the IP limit entirely -- no extension and no manual cookie export. Just tell me which browser you're signed into YouTube on.
 >
-> "Which would you like? (A / B)"
+> "Which would you like? (A / B) -- and if B, which browser are you logged into YouTube on? (chrome / safari / firefox / edge / brave)"
 
-**Option B setup instructions** (show if requested):
-1. Install the Chrome extension **"Get cookies.txt LOCALLY"**
-2. Go to `youtube.com` while logged into your Google account
-3. Click the extension → Export → save the file as `~/youtube-cookies.txt`
-4. Pass the path to the batch script (see below)
+Two things to make clear to the user:
+- If they are **already** rate-limited, Option A will not help -- every anonymous request still returns 429. Option B is the only path that works once a block is active.
+- Option B uses **yt-dlp, not markitdown**, because the markitdown CLI has no cookie support. See **Understanding YouTube rate limits** below.
 
 ---
 
@@ -210,23 +207,61 @@ Explain, then ask:
 Run after all 5 steps are confirmed. Fill in the variables at the top.
 
 ```python
-import subprocess, re, os, time
+import subprocess, re, os, time, json, glob, tempfile
 
 # ---- configure these ----
 DEST = "/path/to/your/output/folder"          # from Step 3
 MARKITDOWN = "markitdown"                      # or full path if not in PATH
 CHANNEL_NAME = "ChannelName"                   # human-readable label
-SLEEP_SECONDS = 5                              # Option A: 5; Option B: 0
-COOKIES = None                                 # Option B: "/path/to/youtube-cookies.txt"
 VIDEOS = []                                    # confirmed list from Step 2: [(date_str, url, title), ...]
+
+# Strategy (from Step 5):
+USE_COOKIES = False     # Option A: False (markitdown + pacing)  |  Option B: True (yt-dlp + browser cookies)
+BROWSER = "chrome"      # Option B only: chrome | safari | firefox | edge | brave
+SLEEP_SECONDS = 5       # Option A: 5  |  Option B: 1 (cookies bypass the limit; a small pause still avoids bursts)
 # -------------------------
 
 def slugify(s):
-    import re
     s = s.lower()
     s = re.sub(r'[^a-z0-9\s-]', '', s)
     s = re.sub(r'\s+', '-', s.strip())
     return re.sub(r'-+', '-', s)[:60].rstrip('-')
+
+def fetch_markitdown(url):
+    """Option A: markitdown CLI. Clean output, but no cookie support -- dies on an IP block."""
+    r = subprocess.run([MARKITDOWN, url], capture_output=True, text=True, timeout=60)
+    content = (r.stdout or "").strip()
+    if "Could not retrieve a transcript" in content or "429" in (r.stderr or "") or len(content) < 500:
+        raise ValueError("transcript unavailable or IP blocked (429)")
+    return content
+
+def fetch_ytdlp_cookies(url):
+    """Option B: yt-dlp pulls the caption track directly, authenticated via your browser
+    cookies. Survives an active IP block. Parses YouTube's json3 caption format."""
+    vid = url.split("v=")[-1].split("&")[0]
+    tmp = tempfile.mkdtemp()
+    subprocess.run([
+        "yt-dlp", "--cookies-from-browser", BROWSER, "--skip-download",
+        "--ignore-no-formats-error",   # new yt-dlp aborts on missing video formats w/o a JS runtime; captions don't need them
+        "--write-auto-subs", "--write-subs", "--sub-langs", "en.*", "--sub-format", "json3",
+        "-o", os.path.join(tmp, "%(id)s.%(ext)s"), url,
+    ], capture_output=True, text=True, timeout=120)
+    files = sorted(glob.glob(os.path.join(tmp, f"{vid}*.json3")))
+    if not files:
+        raise ValueError("no caption track (video has none, or browser not logged into YouTube)")
+    data = json.load(open(files[0]))
+    parts = []
+    for e in data.get("events", []):
+        segs = e.get("segs")
+        if not segs:
+            continue
+        t = "".join(s.get("utf8", "") for s in segs)
+        if t.strip():
+            parts.append(t.strip())
+    text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+    if len(text) < 500:
+        raise ValueError("transcript too short / empty")
+    return text
 
 os.makedirs(DEST, exist_ok=True)
 ok, failed, skipped = [], [], []
@@ -242,18 +277,8 @@ for date_str, url, title in VIDEOS:
         continue
 
     print(f"Fetching: {title[:60]}...", flush=True)
-
-    cmd = [MARKITDOWN, url]
-    if COOKIES:
-        cmd = [MARKITDOWN, "--cookies", os.path.expanduser(COOKIES), url]
-
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        content = result.stdout.strip()
-
-        # detect IP block or empty transcript
-        if "Could not retrieve a transcript" in content or len(content) < 500:
-            raise ValueError("transcript unavailable or IP blocked")
+        content = fetch_ytdlp_cookies(url) if USE_COOKIES else fetch_markitdown(url)
 
         frontmatter = f"""---
 title: "{title}"
@@ -267,7 +292,6 @@ transcript_available: true
 """
         with open(filepath, 'w') as f:
             f.write(frontmatter + content)
-
         print(f"  -> saved ({len(content):,} chars)")
         ok.append(filename)
 
@@ -280,13 +304,10 @@ url: "{url}"
 source: "{CHANNEL_NAME}"
 type: video-transcript
 transcript_available: false
-retry_note: "Re-run: {MARKITDOWN} \\"{url}\\""
+retry_note: "Failed during batch. If IP-blocked, re-run the batch with USE_COOKIES = True (Option B)."
 ---
 
-*Transcript unavailable. Re-fetch:*
-```
-{MARKITDOWN} "{url}"
-```
+*Transcript unavailable (IP block or no caption track). Re-fetch by re-running the batch in Option B / cookie mode.*
 """
         with open(filepath, 'w') as f:
             f.write(stub)
@@ -297,9 +318,9 @@ retry_note: "Re-run: {MARKITDOWN} \\"{url}\\""
 
 print(f"\nDone: {len(ok)} saved  |  {len(failed)} failed  |  {len(skipped)} skipped")
 if failed:
-    print("\nFailed (retry after IP cooldown or switch to Option B):")
+    print("\nFailed -- if these were IP-blocked, re-run with USE_COOKIES = True (Option B):")
     for fn, err in failed:
-        print(f"  {fn}")
+        print(f"  {fn}  ({err})")
 ```
 
 ---
@@ -338,21 +359,35 @@ transcripts_compared: N
 
 | Error | Cause | Fix |
 |---|---|---|
-| `Could not retrieve a transcript` | YouTube IP rate limit hit | Wait a few hours and retry, or switch to Option B (cookies) |
+| `Could not retrieve a transcript` / `HTTP 429` / `Sign in to confirm you're not a bot` | YouTube IP rate limit -- anonymous requests blocked | Switch to **Option B (browser cookies)**; it works even while blocked. Waiting it out is unreliable (a block can last a day+). |
 | File saved but < 500 chars | Members-only or transcript-disabled video | Stub written with `transcript_available: false` |
 | `yt-dlp: command not found` | Not installed or not in PATH | See Pre-flight check above |
 | `markitdown: command not found` | Not installed or not in PATH | See Pre-flight check above |
+| yt-dlp: `Requested format is not available` / `Only images are available` | New yt-dlp needs a JS runtime to resolve video formats | Harmless for transcripts -- the batch already passes `--ignore-no-formats-error`, and captions download regardless |
 | All flat-playlist dates show "unknown" | yt-dlp limitation on this endpoint | Always use the Step 2c batch date-verify command -- never trust flat-playlist timestamps |
 
 ---
 
-## Quick reference -- rate limit expectations
+## Understanding YouTube rate limits
 
-| Strategy | Requests before block | Speed | Setup needed |
-|---|---|---|---|
-| No delay (default) | ~15-20 | Fast | None |
-| Option A: 5s sleep | ~50+ | ~7s per video | None |
-| Option B: cookies | Effectively unlimited | ~3s per video | One-time Chrome export |
+YouTube throttles **anonymous** transcript/caption requests from a single IP. Knowing how the block behaves saves a lot of confusion:
+
+- **Trigger:** roughly 15-20 requests in a row with no authentication.
+- **Symptom:** `HTTP 429: Too Many Requests` (often served as a `google.com/sorry` page) and, in yt-dlp, `Sign in to confirm you're not a bot`.
+- **Stickiness:** the block does NOT clear in a few minutes. It commonly lasts hours, sometimes a day or more -- waiting is unreliable.
+- **Key consequence:** once blocked, pacing (Option A) no longer helps; every anonymous request still returns 429. Only authentication gets through.
+
+**How the two strategies map to this:**
+
+| Strategy | Tool | Requests before block | Speed | Setup |
+|---|---|---|---|---|
+| No delay (don't) | markitdown | ~15-20 | fast | none |
+| **Option A -- pacing** | markitdown | ~50+ | ~7s / video | none |
+| **Option B -- browser cookies** | yt-dlp | effectively unlimited, and works even while already blocked | ~3s / video | none beyond being logged into YouTube in a browser |
+
+**Why Option B uses yt-dlp, not markitdown:** the markitdown CLI has no cookie option, so it cannot authenticate. yt-dlp can read your browser session directly with `--cookies-from-browser <browser>` (no extension, no manual export) and pull the caption track even when the IP is blocked. That is why the cookie path is a separate code branch in the batch script above -- it fetches YouTube's `json3` caption file and parses it to plain text.
+
+**On `--cookies-from-browser`:** yt-dlp reads the cookie database of the named browser (`chrome`, `safari`, `firefox`, `edge`, `brave`). On macOS it may request Keychain access the first time. If yt-dlp reports the cookie DB is locked, close the browser and retry.
 
 ---
 
