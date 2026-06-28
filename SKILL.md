@@ -63,6 +63,8 @@ npm install -g yt-dlp
 pip install 'markitdown[youtube-transcription]'
 ```
 
+> **Optional:** you can skip this. If markitdown has no YouTube support, **Option A automatically falls back to cookie-free `yt-dlp`** (json3 captions) -- fine for small / single pulls. Install the extra only if you prefer markitdown's output for larger Option-A batches.
+
 After install, find the binary path if it's not in PATH:
 ```bash
 find ~ /Library/Frameworks -name "markitdown" 2>/dev/null | grep -v ".py$"
@@ -188,7 +190,7 @@ Explain, then ask:
 > "YouTube throttles transcript requests after roughly 15-20 in a row from the same IP (you'll see `HTTP 429` / 'Sign in to confirm you're not a bot'). Two ways to handle it:"
 >
 > **Option A -- Pacing** (recommended for a first, small run)
-> A 5-second pause between requests. Reliable up to ~50 videos, no setup. Uses markitdown.
+> A 5-second pause between requests. Reliable up to ~50 videos, no setup. Uses markitdown -- and if markitdown's youtube extra isn't installed, auto-falls-back to cookie-free `yt-dlp` (json3), fine for small / single pulls.
 > Estimated time: roughly N × 7 seconds total.
 >
 > **Option B -- Browser cookies** (for large batches, or if you're already blocked)
@@ -216,7 +218,7 @@ CHANNEL_NAME = "ChannelName"                   # human-readable label
 VIDEOS = []                                    # confirmed list from Step 2: [(date_str, url, title), ...]
 
 # Strategy (from Step 5):
-USE_COOKIES = False     # Option A: False (markitdown + pacing)  |  Option B: True (yt-dlp + browser cookies)
+USE_COOKIES = False     # Option A: False (markitdown, then cookie-free yt-dlp fallback)  |  Option B: True (yt-dlp + browser cookies)
 BROWSER = "chrome"      # Option B only: chrome | safari | firefox | edge | brave
 SLEEP_SECONDS = 5       # Option A: 5  |  Option B: 1 (cookies bypass the limit; a small pause still avoids bursts)
 # -------------------------
@@ -228,28 +230,17 @@ def slugify(s):
     return re.sub(r'-+', '-', s)[:60].rstrip('-')
 
 def fetch_markitdown(url):
-    """Option A: markitdown CLI. Clean output, but no cookie support -- dies on an IP block."""
+    """Option A primary: markitdown CLI. Clean output, but needs the youtube extra
+    installed and has no cookie support -- dies on an IP block."""
     r = subprocess.run([MARKITDOWN, url], capture_output=True, text=True, timeout=60)
     content = (r.stdout or "").strip()
     if "Could not retrieve a transcript" in content or "429" in (r.stderr or "") or len(content) < 500:
-        raise ValueError("transcript unavailable or IP blocked (429)")
+        raise ValueError("transcript unavailable, markitdown youtube extra missing, or IP blocked (429)")
     return content
 
-def fetch_ytdlp_cookies(url):
-    """Option B: yt-dlp pulls the caption track directly, authenticated via your browser
-    cookies. Survives an active IP block. Parses YouTube's json3 caption format."""
-    vid = url.split("v=")[-1].split("&")[0]
-    tmp = tempfile.mkdtemp()
-    subprocess.run([
-        "yt-dlp", "--cookies-from-browser", BROWSER, "--skip-download",
-        "--ignore-no-formats-error",   # new yt-dlp aborts on missing video formats w/o a JS runtime; captions don't need them
-        "--write-auto-subs", "--write-subs", "--sub-langs", "en.*", "--sub-format", "json3",
-        "-o", os.path.join(tmp, "%(id)s.%(ext)s"), url,
-    ], capture_output=True, text=True, timeout=120)
-    files = sorted(glob.glob(os.path.join(tmp, f"{vid}*.json3")))
-    if not files:
-        raise ValueError("no caption track (video has none, or browser not logged into YouTube)")
-    data = json.load(open(files[0]))
+def _parse_json3(path):
+    """YouTube's json3 caption format -> plain text."""
+    data = json.load(open(path))
     parts = []
     for e in data.get("events", []):
         segs = e.get("segs")
@@ -258,7 +249,30 @@ def fetch_ytdlp_cookies(url):
         t = "".join(s.get("utf8", "") for s in segs)
         if t.strip():
             parts.append(t.strip())
-    text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+def fetch_ytdlp(url, use_cookies):
+    """yt-dlp pulls the caption track and parses YouTube's json3 format.
+    use_cookies=True  (Option B): authenticate via your browser session -- survives an
+                      active IP block.
+    use_cookies=False (Option A fallback): cookie-free, used when markitdown's youtube
+                      extra isn't installed. Fine for small / single pulls -- a single
+                      video won't trip YouTube's anonymous rate limit."""
+    vid = url.split("v=")[-1].split("&")[0]
+    tmp = tempfile.mkdtemp()
+    cookie_args = ["--cookies-from-browser", BROWSER] if use_cookies else []
+    subprocess.run([
+        "yt-dlp", *cookie_args, "--skip-download",
+        "--ignore-no-formats-error",   # new yt-dlp aborts on missing video formats w/o a JS runtime; captions don't need them
+        "--write-auto-subs", "--write-subs", "--sub-langs", "en.*", "--sub-format", "json3",
+        "-o", os.path.join(tmp, "%(id)s.%(ext)s"), url,
+    ], capture_output=True, text=True, timeout=120)
+    files = sorted(glob.glob(os.path.join(tmp, f"{vid}*.json3")))
+    if not files:
+        raise ValueError("no caption track (none available"
+                         + (", or browser not logged into YouTube)" if use_cookies
+                            else ", or IP-blocked -- switch to Option B cookies)"))
+    text = _parse_json3(files[0])
     if len(text) < 500:
         raise ValueError("transcript too short / empty")
     return text
@@ -278,7 +292,13 @@ for date_str, url, title in VIDEOS:
 
     print(f"Fetching: {title[:60]}...", flush=True)
     try:
-        content = fetch_ytdlp_cookies(url) if USE_COOKIES else fetch_markitdown(url)
+        if USE_COOKIES:                      # Option B -- authenticated, survives IP blocks
+            content = fetch_ytdlp(url, use_cookies=True)
+        else:                                # Option A -- markitdown, then cookie-free yt-dlp
+            try:
+                content = fetch_markitdown(url)
+            except Exception:
+                content = fetch_ytdlp(url, use_cookies=False)
 
         frontmatter = f"""---
 title: "{title}"
